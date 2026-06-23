@@ -53,7 +53,7 @@ export MODEL_TAG="${MODEL_TAG:-d36_4b_climbmix}"
 export MODEL_DEPTH=36
 export TARGET_PARAM_DATA_RATIO=12
 export DEVICE_BATCH_SIZE=8
-export DATASET_SHARDS=1000
+export DATASET_SHARDS=1500
 export DATASET_WORKERS=8
 export NPROC_PER_NODE="${SLURM_GPUS_ON_NODE:-7}"
 export SAVE_EVERY=500
@@ -74,7 +74,7 @@ If Slurm grants a non-H200 7-GPU node, cancel and resubmit more selectively. If 
 - The identity conversation JSONL.
 - SFT and chat-eval datasets: SmolTalk, MMLU, GSM8K, ARC, HumanEval, and the spelling word list.
 
-Default `DATASET_SHARDS=1000` downloads enough ClimbMix for the d36 ratio-12 run with room to spare. Set `CLIMBMIX_DATA_DIR` to reuse a local mirror instead of copying shards into each run directory. Set `DATASET_SHARDS=-1` only if you want to mirror the full hosted ClimbMix parquet corpus; that is roughly 600 GB.
+Default `DATASET_SHARDS=1500` downloads enough ClimbMix for the d36 ratio-12 run with the corrected total-parameter token budget. Set `CLIMBMIX_DATA_DIR` to reuse a local mirror instead of copying shards into each run directory. Set `DATASET_SHARDS=-1` only if you want to mirror the full hosted ClimbMix parquet corpus; that is roughly 600 GB.
 
 The local `/u201/l39gu/nanoknow-climbmix/corpus/climbmix-400b-shuffle` mirror already has more than enough train shards for the default d36 run. The repo still expects the validation shard `shard_06542.parquet`; `runs/train_4b.sh` will download it into `CLIMBMIX_DATA_DIR` if it is not already present.
 
@@ -110,3 +110,15 @@ STOP_AFTER=base_train \
 EXTRA_BASE_TRAIN_ARGS="--num-iterations=2 --save-every=1 --core-metric-every=-1 --sample-every=-1 --eval-every=-1" \
 bash runs/train_4b.sh
 ```
+
+## Corrected d36 token horizon
+
+The d36 token horizon now uses all trainable parameters for the ratio calculation. At `TARGET_PARAM_DATA_RATIO=12`, this means roughly `3.8B * 12 = 45.6B` training tokens instead of the old matrix-plus-head denominator that produced `28.4B` tokens.
+
+To continue the current `_w3` base checkpoint to the corrected natural horizon without replaying the first 28.4B tokens, use:
+
+```bash
+sbatch runs/watgpu_4b_continue_corrected.sbatch
+```
+
+The wrapper requires a checkpoint at or beyond step `13769`, resumes from the saved `dataloader_state_dict`, and pins `--total-batch-size=2064384` so the old step count still maps to the already-consumed tokens. Regenerate the identity conversations before running SFT again; the original public identity file describes the old d24/FineWeb speedrun model, not this d36 ClimbMix model.

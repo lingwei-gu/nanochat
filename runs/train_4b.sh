@@ -23,7 +23,7 @@ AUTO_RESUME_SFT="${AUTO_RESUME_SFT:-1}"
 TOKENIZER_SHARDS="${TOKENIZER_SHARDS:-8}"
 TOKENIZER_MAX_CHARS="${TOKENIZER_MAX_CHARS:-2000000000}"
 TOKENIZER_VOCAB_SIZE="${TOKENIZER_VOCAB_SIZE:-32768}"
-DATASET_SHARDS="${DATASET_SHARDS:-1000}"
+DATASET_SHARDS="${DATASET_SHARDS:-1500}"
 DATASET_WORKERS="${DATASET_WORKERS:-8}"
 SAVE_EVERY="${SAVE_EVERY:-250}"
 KEEP_LAST_CHECKPOINTS="${KEEP_LAST_CHECKPOINTS:-4}"
@@ -36,6 +36,8 @@ STOP_AFTER="${STOP_AFTER:-full}"
 CLIMBMIX_DATA_DIR="${CLIMBMIX_DATA_DIR:-}"
 RESUME_FROM_STEP="${RESUME_FROM_STEP:--1}"
 AUTO_RESUME="${AUTO_RESUME:-0}"
+REQUIRE_RESUME="${REQUIRE_RESUME:-0}"
+MIN_RESUME_STEP="${MIN_RESUME_STEP:-}"
 UV_SYNC_EXTRA="${UV_SYNC_EXTRA:-gpu}"
 if [ -z "${NANOCHAT_ENV_DIR:-}" ]; then
     if [ -n "${SLURM_TMPDIR:-}" ]; then
@@ -205,6 +207,14 @@ PY
     else
         log "AUTO_RESUME found no checkpoint; starting from scratch"
     fi
+fi
+if [ "$REQUIRE_RESUME" = "1" ] && [ "$RESUME_FROM_STEP" = "-1" ]; then
+    echo "REQUIRE_RESUME=1 but no checkpoint was found for MODEL_TAG=$MODEL_TAG in $NANOCHAT_BASE_DIR/base_checkpoints/$MODEL_TAG" >&2
+    exit 3
+fi
+if [ -n "$MIN_RESUME_STEP" ] && [ "$RESUME_FROM_STEP" != "-1" ] && [ "$RESUME_FROM_STEP" -lt "$MIN_RESUME_STEP" ]; then
+    echo "Refusing to resume from step $RESUME_FROM_STEP because MIN_RESUME_STEP=$MIN_RESUME_STEP. This would repeat already-trained data." >&2
+    exit 4
 fi
 if [ "$RESUME_FROM_STEP" != "-1" ]; then
     BASE_TRAIN_ARGS+=(--resume-from-step="$RESUME_FROM_STEP")

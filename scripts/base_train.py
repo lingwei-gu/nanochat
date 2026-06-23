@@ -286,14 +286,15 @@ print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # 1) Use scaling laws to determine the optimal training horizon in tokens
 # The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
-# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
 def get_scaling_params(m):
-    # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
+    # Use all trainable parameters for the token budget. This includes the large
+    # value embeddings; for d36 this is ~3.8B instead of the old ~2.37B matrix+head count.
     params_counts = m.num_scaling_params()
-    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
-    return scaling_params
+    return params_counts['total']
+
 num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
+print0(f"Target token budget: {target_tokens:,}")
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
 d12_ref = build_model_meta(12) # creates the model on meta device
@@ -322,6 +323,18 @@ elif total_batch_size % world_tokens_per_fwdbwd != 0:
         f"device_batch_size * max_seq_len * world_size = {world_tokens_per_fwdbwd:,}. "
         f"Try --total-batch-size={suggested_batch_size:,}."
     )
+if resuming:
+    previous_total_batch_size = meta_data.get("total_batch_size")
+    if previous_total_batch_size is not None and previous_total_batch_size != total_batch_size:
+        raise ValueError(
+            f"Refusing to resume with total_batch_size={total_batch_size:,}; "
+            f"checkpoint step {args.resume_from_step:,} was trained with total_batch_size={previous_total_batch_size:,}. "
+            "Changing it would make step-based token accounting repeat or overshoot already-trained data. "
+            f"Resume with --total-batch-size={previous_total_batch_size:,}."
+        )
+    if "dataloader_state_dict" not in meta_data:
+        raise ValueError("Checkpoint metadata has no dataloader_state_dict; refusing to resume because data position is unknown.")
+    print0(f"Resuming dataloader from: {meta_data['dataloader_state_dict']}")
 
 # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
 batch_lr_scale = 1.0
@@ -356,8 +369,15 @@ optimizer = model.setup_optimizer(
 )
 
 if resuming:
+    fresh_group_hparams = [
+        {key: group[key] for key in ("kind", "lr", "initial_lr", "betas", "eps", "weight_decay", "momentum", "ns_steps", "beta2") if key in group}
+        for group in optimizer.param_groups
+    ]
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
+    for group, fresh_hparams in zip(optimizer.param_groups, fresh_group_hparams):
+        group.update(fresh_hparams)
+    print0("Loaded optimizer state from checkpoint; restored param-group hyperparameters for the current horizon")
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
@@ -393,7 +413,8 @@ else:
     raise ValueError("No training horizon specified")
 total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
 print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
+print0(f"Tokens : Total params ratio: {total_tokens / num_params:.2f}")
+print0(f"Tokens : Scaling params ratio: {total_tokens / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
@@ -442,6 +463,8 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+if step > num_iterations:
+    raise ValueError(f"Checkpoint step {step:,} is beyond requested horizon {num_iterations:,}; increase the target horizon before resuming.")
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
@@ -678,9 +701,11 @@ get_report().log(section="Base model training", data=[
     { # stats about the training setup
         "Number of parameters": num_params,
         "Number of FLOPs per token": f"{num_flops_per_token:e}",
+        "Target token budget": target_tokens,
         "Calculated number of iterations": num_iterations,
         "Number of training tokens": total_tokens,
-        "Tokens : Scaling params ratio": total_batch_size * num_iterations / num_scaling_params,
+        "Tokens : Total params ratio": total_tokens / num_params,
+        "Tokens : Scaling params ratio": total_tokens / num_scaling_params,
         "DDP world size": ddp_world_size,
         "warmup_steps": args.warmup_steps,
         "warmdown_ratio": args.warmdown_ratio,
