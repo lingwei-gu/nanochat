@@ -40,6 +40,8 @@ parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the m
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--activation-checkpointing", action="store_true", help="trade recompute for lower activation memory during training")
+parser.add_argument("--no-compile", action="store_true", help="disable torch.compile to reduce persistent compiler memory")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
@@ -142,8 +144,15 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
+if args.activation_checkpointing:
+    model.set_activation_checkpointing(True)
+    print0("Activation checkpointing enabled")
+
 orig_model = model
-model = torch.compile(model, dynamic=False)
+if args.no_compile:
+    print0("torch.compile disabled")
+else:
+    model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank

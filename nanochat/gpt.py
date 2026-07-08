@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
@@ -160,6 +161,7 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        self.activation_checkpointing = False
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -314,6 +316,9 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def set_activation_checkpointing(self, enabled: bool = True):
+        self.activation_checkpointing = enabled
+
     def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
@@ -456,7 +461,18 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if self.activation_checkpointing and self.training and kv_cache is None:
+                window_size = self.window_sizes[i]
+                if ve is None:
+                    def block_forward(x, block=block, cos_sin=cos_sin, window_size=window_size, kv_cache=kv_cache):
+                        return block(x, None, cos_sin, window_size, kv_cache)
+                    x = checkpoint(block_forward, x, use_reentrant=False, preserve_rng_state=False)
+                else:
+                    def block_forward(x, ve, block=block, cos_sin=cos_sin, window_size=window_size, kv_cache=kv_cache):
+                        return block(x, ve, cos_sin, window_size, kv_cache)
+                    x = checkpoint(block_forward, x, ve, use_reentrant=False, preserve_rng_state=False)
+            else:
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

@@ -12,7 +12,9 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+_alloc_conf = os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or "expandable_segments:True"
+os.environ.setdefault("PYTORCH_ALLOC_CONF", _alloc_conf)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", _alloc_conf)
 import gc
 import json
 import time
@@ -48,7 +50,7 @@ def _handle_stop_signal(signum, frame):
     except ValueError:
         _stop_signal_name = str(signum)
 
-for _signal_name in ("SIGUSR1", "SIGTERM", "SIGINT"):
+for _signal_name in ("SIGHUP", "SIGUSR1", "SIGTERM", "SIGINT"):
     _signal = getattr(signal, _signal_name, None)
     if _signal is not None:
         signal.signal(_signal, _handle_stop_signal)
@@ -60,6 +62,8 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--activation-checkpointing", action="store_true", help="trade recompute for lower activation memory during training")
+parser.add_argument("--no-compile", action="store_true", help="disable torch.compile to reduce persistent compiler memory")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -84,7 +88,9 @@ parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate 
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
+parser.add_argument("--muon-momentum-override", type=float, default=-1.0, help="constant Muon momentum override (-1 = use schedule)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--allow-missing-optimizer-state", action="store_true", help="resume model/data position with a fresh optimizer if optimizer shards are unavailable")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -184,7 +190,21 @@ checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    load_optimizer_state = True
+    if args.allow_missing_optimizer_state:
+        expected_optimizer_paths = [
+            os.path.join(checkpoint_dir, f"optim_{args.resume_from_step:06d}_rank{rank:d}.pt")
+            for rank in range(ddp_world_size)
+        ]
+        missing_optimizer_paths = [path for path in expected_optimizer_paths if not os.path.exists(path)]
+        if missing_optimizer_paths:
+            load_optimizer_state = False
+            print0(
+                "WARNING: missing optimizer state for "
+                f"{len(missing_optimizer_paths)}/{ddp_world_size} rank(s); "
+                "continuing with a fresh optimizer because --allow-missing-optimizer-state is set"
+            )
+    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=load_optimizer_state, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -269,8 +289,15 @@ def disable_fp8(model):
 # -----------------------------------------------------------------------------
 # Compile the model
 
+if args.activation_checkpointing:
+    model.set_activation_checkpointing(True)
+    print0("Activation checkpointing enabled")
+
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.no_compile:
+    print0("torch.compile disabled")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -373,11 +400,14 @@ if resuming:
         {key: group[key] for key in ("kind", "lr", "initial_lr", "betas", "eps", "weight_decay", "momentum", "ns_steps", "beta2") if key in group}
         for group in optimizer.param_groups
     ]
-    optimizer.load_state_dict(optimizer_data)
-    del optimizer_data
-    for group, fresh_hparams in zip(optimizer.param_groups, fresh_group_hparams):
-        group.update(fresh_hparams)
-    print0("Loaded optimizer state from checkpoint; restored param-group hyperparameters for the current horizon")
+    if optimizer_data is not None:
+        optimizer.load_state_dict(optimizer_data)
+        del optimizer_data
+        for group, fresh_hparams in zip(optimizer.param_groups, fresh_group_hparams):
+            group.update(fresh_hparams)
+        print0("Loaded optimizer state from checkpoint; restored param-group hyperparameters for the current horizon")
+    else:
+        print0("WARNING: using freshly initialized optimizer state for resumed model/data position")
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
@@ -431,6 +461,10 @@ def get_lr_multiplier(it):
 
 # Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
+    if args.muon_momentum_override >= 0:
+        if not 0 <= args.muon_momentum_override <= 1:
+            raise ValueError(f"--muon-momentum-override must be in [0, 1], got {args.muon_momentum_override}")
+        return args.muon_momentum_override
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     warmdown_start = num_iterations - warmdown_iters
     if it < 400:
